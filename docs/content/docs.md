@@ -2380,6 +2380,7 @@ describes what aspect is being measured:
 - `name` - order by the full path of the files
 - `modtime` - order by the modification date of the files
 - `pattern` - order by a list of path glob patterns
+- `random` - process files in random order
 
 The `size`, `name` and `modtime` comparisons can have a modifier appended with
 a comma:
@@ -2413,6 +2414,7 @@ For example
 - `--order-by modtime,ascending` - send the oldest files first
 - `--order-by name` - send the files with alphabetically by path first
 - `--order-by 'pattern,*.tar.gz,*.md5'` - send archives before checksum files
+- `--order-by random` - send files in random order
 
 If the `--order-by` flag is not supplied or it is supplied with an
 empty string then the default ordering will be used which is as
