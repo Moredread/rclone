@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/bits"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,13 +30,14 @@ type pipe struct {
 	stats     func(items int, totalSize int64)
 	less      lessFn
 	fraction  int
+	random    bool
 }
 
 func newPipe(orderBy string, stats func(items int, totalSize int64), maxBacklog int) (*pipe, error) {
 	if maxBacklog < 0 {
 		maxBacklog = (1 << (bits.UintSize - 1)) - 1 // largest positive int
 	}
-	less, fraction, err := newLess(orderBy)
+	less, fraction, random, err := newLess(orderBy)
 	if err != nil {
 		return nil, fserrors.FatalError(err)
 	}
@@ -44,6 +46,7 @@ func newPipe(orderBy string, stats func(items int, totalSize int64), maxBacklog 
 		stats:    stats,
 		less:     less,
 		fraction: fraction,
+		random:   random,
 	}
 	if p.less != nil {
 		deheap.Init(p)
@@ -94,7 +97,7 @@ func (p *pipe) Put(ctx context.Context, pair fs.ObjectPair) (ok bool) {
 	}
 	p.mu.Lock()
 	if p.less == nil {
-		// no order-by
+		// no order-by (or random)
 		p.queue = append(p.queue, pair)
 	} else {
 		deheap.Push(p, pair)
@@ -133,7 +136,15 @@ func (p *pipe) GetMax(ctx context.Context, fraction int) (pair fs.ObjectPair, ok
 		}
 	}
 	p.mu.Lock()
-	if p.less == nil {
+	if p.random {
+		// random order - pick a random element
+		n := len(p.queue)
+		i := rand.Intn(n)
+		pair = p.queue[i]
+		p.queue[i] = p.queue[n-1]
+		p.queue[n-1] = fs.ObjectPair{} // avoid memory leak
+		p.queue = p.queue[:n-1]
+	} else if p.less == nil {
 		// no order-by
 		pair = p.queue[0]
 		p.queue[0] = fs.ObjectPair{} // avoid memory leak
@@ -183,13 +194,18 @@ func (p *pipe) Close() {
 
 // newLess returns a less function for the heap comparison or nil if
 // one is not required
-func newLess(orderBy string) (less lessFn, fraction int, err error) {
+func newLess(orderBy string) (less lessFn, fraction int, random bool, err error) {
 	fraction = -1
 	if orderBy == "" {
-		return nil, fraction, nil
+		return nil, fraction, false, nil
 	}
 	parts := strings.Split(orderBy, ",")
 	switch strings.ToLower(parts[0]) {
+	case "random":
+		if len(parts) > 1 {
+			return nil, fraction, false, fmt.Errorf("--order-by random does not take a direction")
+		}
+		return nil, fraction, true, nil
 	case "name":
 		less = func(a, b fs.ObjectPair) bool {
 			return a.Src.Remote() < b.Src.Remote()
@@ -205,16 +221,16 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 		}
 	case "pattern":
 		if len(parts) < 2 {
-			return nil, fraction, fmt.Errorf("pattern requires at least one glob")
+			return nil, fraction, false, fmt.Errorf("pattern requires at least one glob")
 		}
 		matches := make([]func(string) bool, 0, len(parts)-1)
 		for _, glob := range parts[1:] {
 			if glob == "" {
-				return nil, fraction, fmt.Errorf("empty pattern glob")
+				return nil, fraction, false, fmt.Errorf("empty pattern glob")
 			}
 			re, err := filter.GlobPathToRegexp(glob, false)
 			if err != nil {
-				return nil, fraction, fmt.Errorf("bad pattern glob %q: %w", glob, err)
+				return nil, fraction, false, fmt.Errorf("bad pattern glob %q: %w", glob, err)
 			}
 			matches = append(matches, re.MatchString)
 		}
@@ -234,9 +250,9 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 			}
 			return aRemote < bRemote
 		}
-		return less, fraction, nil
+		return less, fraction, false, nil
 	default:
-		return nil, fraction, fmt.Errorf("unknown --order-by comparison %q", parts[0])
+		return nil, fraction, false, fmt.Errorf("unknown --order-by comparison %q", parts[0])
 	}
 	descending := false
 	if len(parts) > 1 {
@@ -249,16 +265,16 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 			if len(parts) > 2 {
 				fraction, err = strconv.Atoi(parts[2])
 				if err != nil {
-					return nil, fraction, fmt.Errorf("bad mixed fraction --order-by %q", parts[2])
+					return nil, fraction, false, fmt.Errorf("bad mixed fraction --order-by %q", parts[2])
 				}
 			}
 
 		default:
-			return nil, fraction, fmt.Errorf("unknown --order-by sort direction %q", parts[1])
+			return nil, fraction, false, fmt.Errorf("unknown --order-by sort direction %q", parts[1])
 		}
 	}
 	if (fraction >= 0 && len(parts) > 3) || (fraction < 0 && len(parts) > 2) {
-		return nil, fraction, fmt.Errorf("bad --order-by string %q", orderBy)
+		return nil, fraction, false, fmt.Errorf("bad --order-by string %q", orderBy)
 	}
 	if descending {
 		oldLess := less
@@ -266,5 +282,5 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 			return !oldLess(a, b)
 		}
 	}
-	return less, fraction, nil
+	return less, fraction, false, nil
 }
