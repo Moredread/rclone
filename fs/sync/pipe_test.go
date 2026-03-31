@@ -3,6 +3,8 @@ package sync
 import (
 	"container/heap"
 	"context"
+	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -213,39 +215,98 @@ func TestPipeOrderBy(t *testing.T) {
 	}
 }
 
+func TestPipeRandom(t *testing.T) {
+	var (
+		stats = func(n int, size int64) {}
+		ctx   = context.Background()
+	)
+
+	// Create several distinct objects
+	objs := make([]fs.ObjectPair, 20)
+	for i := range objs {
+		name := fmt.Sprintf("file%02d", i)
+		objs[i] = fs.ObjectPair{Src: mockobject.New(name).WithContent([]byte{byte(i)}, mockobject.SeekModeNone)}
+	}
+
+	p, err := newPipe("random", stats, 100)
+	require.NoError(t, err)
+
+	for _, pair := range objs {
+		ok := p.Put(ctx, pair)
+		require.True(t, ok)
+	}
+
+	// Read all back
+	got := make([]string, 0, len(objs))
+	for range objs {
+		pair, ok := p.Get(ctx)
+		require.True(t, ok)
+		got = append(got, pair.Src.Remote())
+	}
+
+	// All items should be returned
+	assert.Len(t, got, len(objs))
+	sorted := make([]string, len(got))
+	copy(sorted, got)
+	slices.Sort(sorted)
+	expected := make([]string, len(objs))
+	for i := range objs {
+		expected[i] = fmt.Sprintf("file%02d", i)
+	}
+	assert.Equal(t, expected, sorted, "all items should be present")
+
+	// The order should differ from insertion order at least sometimes.
+	// With 20 items the chance of a random permutation being identical
+	// to the original is 1/20! which is negligible.
+	assert.NotEqual(t, expected, got, "random order should differ from sorted insertion order")
+}
+
 func TestNewLess(t *testing.T) {
 	t.Run("blankOK", func(t *testing.T) {
-		less, _, err := newLess("")
+		less, _, _, err := newLess("")
 		require.NoError(t, err)
 		assert.Nil(t, less)
 	})
 
 	t.Run("tooManyParts", func(t *testing.T) {
-		_, _, err := newLess("size,asc,toomanyparts")
+		_, _, _, err := newLess("size,asc,toomanyparts")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "bad --order-by string")
 	})
 
 	t.Run("tooManyParts2", func(t *testing.T) {
-		_, _, err := newLess("size,mixed,50,toomanyparts")
+		_, _, _, err := newLess("size,mixed,50,toomanyparts")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "bad --order-by string")
 	})
 
 	t.Run("badMixed", func(t *testing.T) {
-		_, _, err := newLess("size,mixed,32.7")
+		_, _, _, err := newLess("size,mixed,32.7")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "bad mixed fraction")
 	})
 
+	t.Run("randomOK", func(t *testing.T) {
+		less, _, random, err := newLess("random")
+		require.NoError(t, err)
+		assert.Nil(t, less)
+		assert.True(t, random)
+	})
+
+	t.Run("randomNoDirection", func(t *testing.T) {
+		_, _, _, err := newLess("random,ascending")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not take a direction")
+	})
+
 	t.Run("unknownComparison", func(t *testing.T) {
-		_, _, err := newLess("potato")
+		_, _, _, err := newLess("potato")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unknown --order-by comparison")
 	})
 
 	t.Run("unknownSortDirection", func(t *testing.T) {
-		_, _, err := newLess("name,sideways")
+		_, _, _, err := newLess("name,sideways")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unknown --order-by sort direction")
 	})
@@ -276,7 +337,7 @@ func TestNewLess(t *testing.T) {
 		{"modtime,mixed,30", false, false, 30},
 	} {
 		t.Run(test.orderBy, func(t *testing.T) {
-			less, gotFraction, err := newLess(test.orderBy)
+			less, gotFraction, _, err := newLess(test.orderBy)
 			assert.Equal(t, test.wantFraction, gotFraction)
 			require.NoError(t, err)
 			require.NotNil(t, less)

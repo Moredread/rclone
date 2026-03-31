@@ -2378,8 +2378,10 @@ describes what aspect is being measured:
 - `size` - order by the size of the files
 - `name` - order by the full path of the files
 - `modtime` - order by the modification date of the files
+- `random` - process files in random order
 
-This can have a modifier appended with a comma:
+The `random` option does not take a modifier. All other options can
+have a modifier appended with a comma:
 
 - `ascending` or `asc` - order so that the smallest (or oldest) is processed first
 - `descending` or `desc` - order so that the largest (or newest) is processed first
@@ -2403,6 +2405,7 @@ For example
 - `--order-by size,desc` - send the largest files first
 - `--order-by modtime,ascending` - send the oldest files first
 - `--order-by name` - send the files with alphabetically by path first
+- `--order-by random` - send files in random order
 
 If the `--order-by` flag is not supplied or it is supplied with an
 empty string then the default ordering will be used which is as
