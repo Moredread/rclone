@@ -244,29 +244,39 @@ func (op *kvDump) Do(ctx context.Context, b kv.Bucket) error {
 	}
 
 	num := 0
-	cur := b.Cursor()
-	var bkey, data []byte
-	if baseRoot != "" {
-		bkey, data = cur.Seek([]byte(baseRoot))
-	} else {
-		bkey, data = cur.First()
-	}
-	for bkey != nil {
+	emit := func(bkey, data []byte) {
 		key := string(bkey)
-		if !(baseRoot == "" || key == baseRoot || strings.HasPrefix(key, baseRoot+"/")) {
-			break
-		}
 		var r hashRecord
 		if err := r.decode(key, data); err != nil {
 			fs.Errorf(nil, "%s: invalid record: %v", key, err)
-			continue
+			return
 		}
 		if key = strings.TrimPrefix(key[len(baseRoot):], "/"); key == "" {
 			key = "/"
 		}
 		fmt.Println(f.dumpLine(&r, key, true, nil))
 		num++
-		bkey, data = cur.Next()
+	}
+
+	cur := b.Cursor()
+	if baseRoot == "" {
+		for bkey, data := cur.First(); bkey != nil; bkey, data = cur.Next() {
+			emit(bkey, data)
+		}
+	} else {
+		// A record keyed exactly as baseRoot exists only when the hasher
+		// points directly at a single file; fetch it separately as Seek to
+		// baseRoot+"/" would skip it.
+		if data := b.Get([]byte(baseRoot)); data != nil {
+			emit([]byte(baseRoot), data)
+		}
+		// Seek straight to baseRoot+"/" so sibling keys that sort into the
+		// gap [baseRoot, baseRoot+"/") (e.g. "foo-bar" next to "foo/baz")
+		// don't terminate the scan before the real contents are reached.
+		prefix := baseRoot + "/"
+		for bkey, data := cur.Seek([]byte(prefix)); bkey != nil && strings.HasPrefix(string(bkey), prefix); bkey, data = cur.Next() {
+			emit(bkey, data)
+		}
 	}
 	fs.Infof(dbPath, "%d records", num)
 	op.num = num // for unit tests
