@@ -35,6 +35,15 @@ type Policy interface {
 	SearchEntries(entries ...upstream.Entry) (upstream.Entry, error)
 }
 
+// Reserver is implemented by CREATE policies that reserve space on the branch
+// they choose (using the size passed via WithReserveSize), so that concurrent
+// uploads do not all target the same branch. The upload path must Release the
+// reservation on each chosen upstream once the upload attempt has finished.
+type Reserver interface {
+	// ReservesSpace reports whether this policy reserves space at Create time.
+	ReservesSpace() bool
+}
+
 func registerPolicy(name string, p Policy) {
 	policies[strings.ToLower(name)] = p
 }

@@ -37,9 +37,10 @@ type Fs struct {
 	cacheExpiry atomic.Int64  // usage cache expiry time
 	cacheMutex  sync.RWMutex
 	cacheOnce   sync.Once
-	cacheUpdate bool // if the cache is updating
-	writeback   bool // writeback to this upstream
-	writebackFs *Fs  // if non zero, writeback to this upstream
+	cacheUpdate bool         // if the cache is updating
+	reserved    atomic.Int64 // bytes reserved by in-flight uploads, subtracted from free space
+	writeback   bool         // writeback to this upstream
+	writebackFs *Fs          // if non zero, writeback to this upstream
 }
 
 // Directory describes a wrapped Directory
@@ -416,7 +417,36 @@ func (f *Fs) GetFreeSpace() (int64, error) {
 	if f.usage.Free == nil {
 		return math.MaxInt64 - 1, ErrUsageFieldNotSupported
 	}
-	return *f.usage.Free, nil
+	// Subtract space already claimed by in-flight uploads so concurrent
+	// create decisions don't all target the same branch.
+	free := *f.usage.Free - f.reserved.Load()
+	if free < 0 {
+		free = 0
+	}
+	return free, nil
+}
+
+// Reserve claims size bytes of free space on this upstream for an in-flight
+// upload. The reservation is reflected by GetFreeSpace until Release is called.
+func (f *Fs) Reserve(size int64) {
+	if size <= 0 {
+		return
+	}
+	f.reserved.Add(size)
+}
+
+// Release returns a previous Reserve(size) once the upload has completed or
+// failed.
+func (f *Fs) Release(size int64) {
+	if size <= 0 {
+		return
+	}
+	f.reserved.Add(-size)
+}
+
+// Reserved returns the number of bytes currently reserved by in-flight uploads.
+func (f *Fs) Reserved() int64 {
+	return f.reserved.Load()
 }
 
 // GetUsedSpace get the used space of the fs
