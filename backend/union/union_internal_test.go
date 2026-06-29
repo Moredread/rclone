@@ -3,11 +3,14 @@ package union
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/union/policy"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
@@ -78,6 +81,94 @@ func (f *Fs) InternalTest(t *testing.T) {
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)
+
+// TestReservePutReleases drives real concurrent uploads through a union whose
+// create policy is the reservation-aware mfsreserve, and checks that every
+// reservation made at create time is released once the upload finishes - i.e.
+// the put() wiring reserves and releases in balance and nothing leaks.
+func TestReservePutReleases(t *testing.T) {
+	if *fstest.RemoteName != "" {
+		t.Skip("Skipping as -remote set")
+	}
+	ctx := context.Background()
+	dirs := MakeTestDirs(t, 2)
+	fsString := fmt.Sprintf(":union,upstreams='%s %s',create_policy=mfsreserve:", dirs[0], dirs[1])
+	f, err := fs.NewFs(ctx, fsString)
+	require.NoError(t, err)
+	unionFs := f.(*Fs)
+
+	// The create policy must actually be reservation-aware, otherwise put()
+	// never reserves and this test proves nothing.
+	_, ok := unionFs.createPolicy.(policy.Reserver)
+	require.True(t, ok, "create policy should implement policy.Reserver")
+
+	const n = 8
+	const size = 100
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			contents := random.String(size)
+			name := fmt.Sprintf("file%d.txt", i)
+			src := object.NewStaticObjectInfo(name, time.Now(), int64(len(contents)), true, nil, nil)
+			_, errs[i] = f.Put(ctx, bytes.NewBufferString(contents), src)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i])
+	}
+
+	// Every reservation must have been released after the uploads finished.
+	for _, u := range unionFs.upstreams {
+		assert.Zero(t, u.Reserved(), "reservation leaked on upstream %s", u.Name())
+	}
+
+	// All files are present and readable through the union.
+	for i := 0; i < n; i++ {
+		o, err := f.NewObject(ctx, fmt.Sprintf("file%d.txt", i))
+		require.NoError(t, err)
+		assert.Equal(t, int64(size), o.Size())
+	}
+}
+
+// errReader fails the upload by returning an error instead of data.
+type errReader struct{ err error }
+
+func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
+
+// TestReservePutReleasesOnFailure exercises the failure recovery path: the
+// create policy reserves space, the upload then fails, and the reservation
+// must still be released so a failed upload does not permanently shrink the
+// branch's apparent free space.
+func TestReservePutReleasesOnFailure(t *testing.T) {
+	if *fstest.RemoteName != "" {
+		t.Skip("Skipping as -remote set")
+	}
+	ctx := context.Background()
+	dirs := MakeTestDirs(t, 2)
+	fsString := fmt.Sprintf(":union,upstreams='%s %s',create_policy=mfsreserve:", dirs[0], dirs[1])
+	f, err := fs.NewFs(ctx, fsString)
+	require.NoError(t, err)
+	unionFs := f.(*Fs)
+
+	// A non-trivial size so the reservation is observable if it were to leak.
+	src := object.NewStaticObjectInfo("fail.txt", time.Now(), 1024, true, nil, nil)
+	_, err = f.Put(ctx, errReader{err: errors.New("boom")}, src)
+	require.Error(t, err, "upload from a failing reader must error")
+
+	// Even though the upload failed, the reservation made at create time must
+	// have been released - nothing leaked on any branch.
+	for _, u := range unionFs.upstreams {
+		assert.Zero(t, u.Reserved(), "reservation leaked after failed upload on %s", u.Name())
+	}
+
+	// And the failed upload left no object behind in the union.
+	_, err = f.NewObject(ctx, "fail.txt")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound, "failed upload must not leave an object")
+}
 
 // This specifically tests a union of local which can Move but not
 // Copy and :memory: which can Copy but not Move to makes sure that
