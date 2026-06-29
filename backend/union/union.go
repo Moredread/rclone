@@ -532,12 +532,37 @@ func multiReader(n int, in io.Reader) ([]io.Reader, <-chan error) {
 
 func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, stream bool, options ...fs.OpenOption) (fs.Object, error) {
 	srcPath := src.Remote()
-	upstreams, err := f.create(ctx, srcPath)
+	size := src.Size()
+	// If the create policy reserves space (e.g. mfsreserve), tell it how big
+	// this file is so it can claim that space on the branch it picks, keeping
+	// concurrent uploads from all targeting the same branch. Only the file
+	// create carries the reserve size - mkdir below must not reserve.
+	createCtx := ctx
+	reserve := false
+	if r, ok := f.createPolicy.(policy.Reserver); ok && r.ReservesSpace() && size >= 0 {
+		createCtx = policy.WithReserveSize(ctx, size)
+		reserve = true
+	}
+	upstreams, err := f.create(createCtx, srcPath)
+	// The reservation is only made when create succeeds under the reserve
+	// context; otherwise there is nothing to release.
+	reserved := reserve && err == nil
 	if err == fs.ErrorObjectNotFound {
 		upstreams, err = f.mkdir(ctx, parentDir(srcPath))
 	}
 	if err != nil {
 		return nil, err
+	}
+	if reserved {
+		// Release once the upload attempt has finished. A successful
+		// Put/PutStream already debits the branch's cached free space, so
+		// releasing avoids double counting; on failure it simply undoes the
+		// reservation.
+		defer func() {
+			for _, u := range upstreams {
+				u.Release(size)
+			}
+		}()
 	}
 	if len(upstreams) == 1 {
 		u := upstreams[0]
