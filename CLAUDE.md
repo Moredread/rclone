@@ -23,24 +23,28 @@ in the justfile defaults to it):
    the whole combined tree available while developing.
 2. Split each finished commit onto the right topic branch: `feature/*` for changes
    destined for upstream, `private/feature/*` for fork-local ones.
-3. Run `just regen-all` to reconcile. It:
-   - rebases every `feature/*` and `private/feature/*` onto the mainline (keeping each a
-     clean single-topic branch — its PR home), then
-   - rebuilds `private/all` as `<base>` + each topic's own commits, cherry-picked
-     (`feature/*` first, then `private/feature/*`).
+3. Run `just regen-all` to reconcile. It rebuilds `private/all` as `<base>` + each
+   topic's own commits, cherry-picked (`feature/*` first, then `private/feature/*`).
+   It does **not** rebase the topic branches: each stays on the upstream commit it
+   forked from, and its own commits are taken as `git merge-base <branch>
+   upstream/master`..`<branch>`. That keeps the topic branches stable as upstream
+   advances — no churn, no force-pushing just to track mainline.
 
    `just regen-all <base>` builds `private/all` on a different `<base>` (e.g. a stable
    release tag) while still taking each topic's commits relative to the mainline.
 
-On a conflict, `regen-all` halts mid rebase/cherry-pick. Resolve and
-`git rebase --continue` / `git cherry-pick --continue` (or `--abort`) — do **not** re-run
-`regen-all`, which would reset `private/all`.
+On a cherry-pick conflict, `regen-all` halts. Resolve and `git cherry-pick --continue`
+(or `--abort`) — do **not** re-run `regen-all`, which would reset `private/all`.
+
+Use `just push-features` to push the topic branches to `origin`
+(`--force-with-lease`, for when you've amended or rebased one yourself).
 
 ## Build
 
-Go is not installed system-wide (NixOS); recipes run it via `nix-shell -p go` and redirect
-the Go caches to `~/.cache` (the default `~/go` GOPATH is read-only under the sandbox). All
-builds produce a fully static (`CGO_ENABLED=0`) binary with the git-describe version baked in.
+Go is not installed system-wide (NixOS); recipes run it via the flake dev shell
+(`nix develop`, which pins the toolchain through `flake.lock`) and redirect the Go caches to
+`~/.cache` (the default `~/go` GOPATH is read-only under the sandbox). All builds produce a
+fully static (`CGO_ENABLED=0`) binary with the git-describe version baked in.
 
 - `just build` — static binary for the host → `rclone-static`
 - `just cross <goos> <goarch>` — cross-compile → `rclone-static-<goos>-<goarch>`
