@@ -1,7 +1,8 @@
 # Build a static rclone binary.
-# Go isn't installed system-wide on this NixOS box, so recipes run go
-# through `nix-shell -p go`. Caches are redirected to ~/.cache because the
-# default GOPATH (~/go) is read-only under the sandbox.
+# Go isn't installed system-wide on this NixOS box, so recipes run go through
+# the flake dev shell (`nix develop`), which pins the toolchain via flake.lock.
+# Caches are redirected to ~/.cache because the default GOPATH (~/go) is
+# read-only under the sandbox.
 
 # Version string baked into the binary (git describe, falls back to commit).
 tag := `git describe --tags --always --dirty 2>/dev/null || echo unknown`
@@ -12,8 +13,8 @@ export GOPATH := env_var('HOME') / ".cache/go"
 export GOCACHE := env_var('HOME') / ".cache/go-build"
 export GOMODCACHE := env_var('HOME') / ".cache/go/pkg/mod"
 
-# Wrapper so every recipe gets go without a system install.
-go := "nix-shell -p go --run"
+# Wrapper so every recipe gets the flake-pinned go without a system install.
+go := "nix develop --command bash -c"
 
 # List available recipes.
 default:
@@ -22,21 +23,23 @@ default:
 # Mainline that topic branches are developed on (and PR'd against).
 mainline := "upstream/master"
 
-# Regenerate everything from a fresh base.
+# Rebuild private/all from the topic branches, without disturbing them.
 #
-# <base> (default = mainline, upstream/master) controls only what private/all is
-# built on; it may be a divergent branch such as a stable release. Each topic
-# branch's own commits are always taken relative to the mainline, so:
-#   1. every feature/* and private/feature/* topic branch is rebased onto the
-#      mainline, staying a clean single-topic branch (its PR home);
-#   2. private/all is rebuilt as <base> + every topic branch's own commits
-#      (feature/* first, then private/feature/*), cherry-picked in. Cherry-pick
-#      is used because <base> need not share history with the topic branches.
+# Topic branches are left exactly where they are — regen-all does NOT rebase
+# them onto the mainline, so they stay put as upstream advances and never need a
+# force-push. Each branch's own commits are found via its merge-base with the
+# mainline (the fork-off point), so a branch may sit on an old upstream commit
+# and still contribute exactly its own commits.
 #
-# On conflict the in-progress rebase/cherry-pick is left for you to resolve;
-# finish it with `git rebase --continue` / `git cherry-pick --continue` (do NOT
-# re-run regen-all mid-operation — it would reset private/all). `--abort` backs
-# out the current step.
+# <base> (default = mainline, upstream/master) is only what private/all is built
+# on; it may be a divergent branch such as a stable release. private/all is
+# rebuilt as <base> + every topic branch's own commits (feature/* first, then
+# private/feature/*), cherry-picked in. Cherry-pick is used because <base> need
+# not share history with the topic branches.
+#
+# On a cherry-pick conflict the in-progress pick is left for you to resolve;
+# finish it with `git cherry-pick --continue` (do NOT re-run regen-all
+# mid-operation — it would reset private/all). `--abort` backs out the pick.
 regen-all base=mainline:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -69,22 +72,13 @@ regen-all base=mainline:
     mapfile -t branches < <(git for-each-ref --format='%(refname:short)' \
         'refs/heads/feature/*' 'refs/heads/private/feature/*')
 
-    trap 'echo ">> halted (conflict?). Resolve and run git rebase/cherry-pick --continue (or --abort)." >&2' ERR
+    trap 'echo ">> halted (cherry-pick conflict?). Resolve and run git cherry-pick --continue (or --abort)." >&2' ERR
 
-    # 1. Rebase each topic branch onto the mainline (keeps it a clean topic).
-    for b in "${branches[@]}"; do
-        fork="$(git merge-base "$b" "$mainref" 2>/dev/null || true)"
-        if [ -z "$fork" ]; then
-            echo ">> skipping $b: no common ancestor with $mainline" >&2
-            continue
-        fi
-        echo ">> rebasing $b onto $mainline"
-        git rebase --onto "$mainref" "$fork" "$b"
-    done
-
-    # 2. Rebuild private/all = base + every topic branch's own commits.
-    #    Own commits are (merge-base with mainline)..branch, so they replay
-    #    cleanly onto a <base> that need not share the topic branch's history.
+    # Rebuild private/all = base + every topic branch's own commits. The topic
+    # branches themselves are left untouched. A branch's own commits are
+    # (merge-base with mainline)..branch — everything since its fork-off point —
+    # so they replay cleanly onto a <base> that need not share the branch's
+    # history, regardless of which upstream commit the branch sits on.
     git checkout -B private/all "$baseref"
     for b in "${branches[@]}"; do
         fork="$(git merge-base "$b" "$mainref" 2>/dev/null || true)"
@@ -95,6 +89,20 @@ regen-all base=mainline:
         fi
     done
     echo ">> private/all regenerated at $(git rev-parse --short private/all)"
+
+# Uses --force-with-lease so an amended or rebased topic branch still pushes,
+# while refusing the push if origin moved since your last fetch (protecting
+# against clobbering work pushed from elsewhere).
+# Push every topic branch (feature/*, private/feature/*) to origin (force-with-lease).
+push-features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mapfile -t branches < <(git for-each-ref --format='%(refname:short)' \
+        'refs/heads/feature/*' 'refs/heads/private/feature/*')
+    for b in "${branches[@]}"; do
+        echo ">> force-pushing $b"
+        git push --force-with-lease origin "$b"
+    done
 
 # Build a fully static binary for the host platform.
 build:
